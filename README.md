@@ -25,10 +25,11 @@ qg check             gate   integrity → build → tests → mutation score ≥
 ## Install
 
 ```bash
-claude --plugin-dir ~/Documents/ios-quality-gate      # one session
+claude plugin marketplace add MatiasPC/ios-quality-gate
+claude plugin install ios-quality-gate@matiaspc-local
 ```
 
-Or add it to a local marketplace to install permanently. Requires `python3` and `git`.
+Or try it for one session with `claude --plugin-dir <clone>`. Requires `python3` and `git`.
 
 ## Configure (optional) — `.quality-gate.json` at the repo root
 
