@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""qg — a quality gate that keeps coding agents honest on Swift/iOS projects.
+
+Workflow (one feature at a time):
+  qg start "title"   phase RED: write failing tests for behaviour that does not exist yet
+  qg lock            proves the new tests fail, freezes them, phase GREEN
+  (implement)        hooks block any edit to test files while GREEN
+  qg check           integrity + build + tests + mutation testing on the changed lines
+  The Stop hook runs `qg check` automatically: the agent cannot finish while it fails.
+
+When a locked test is wrong (agent):
+  qg escalate "why"  stop for a human; tests stay locked and the Stop hook lets the agent finish
+
+Human-only escape hatches (the PreToolUse hook blocks agents from running them):
+  qg unlock          back to RED, e.g. a locked test turned out to be wrong
+  qg reset           forget the current gate
+
+Stdlib only. Config: optional `.quality-gate.json` at the repo root (see DEFAULT_CONFIG).
+"""
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DEFAULT_CONFIG = {
+    # fnmatch patterns on repo-relative posix paths; `*` also crosses `/`.
+    "test_globs": ["Tests/*", "*Tests/*", "*Tests.swift", "*Spec.swift"],
+    "source_globs": ["*.swift"],
+    "ignore_globs": [".build/*", "*/.build/*", "Package.swift", "*.generated.swift", "DerivedData/*"],
+    # SwiftPM defaults. For an Xcode app, e.g.:
+    #   build_cmd: "xcodebuild build-for-testing -scheme App -destination 'platform=iOS Simulator,name=iPhone 17' -quiet"
+    #   test_cmd:  "xcodebuild test-without-building -scheme App -destination 'platform=iOS Simulator,name=iPhone 17' -quiet"
+    "build_cmd": "swift build --build-tests",
+    "test_cmd": "swift test --skip-build",
+    "mutation_threshold": 0.8,
+    "max_mutants": 40,
+    "command_timeout": 600,
+    "max_stop_blocks": 6,
+}
+
+STATE_DIR = ".quality-gate"
+ACTIVE = ("red", "green", "escalated")
+LOCKED = ("green", "escalated")
+CONFIG_FILE = ".quality-gate.json"
+BACKUP_FILE = "mutation-backup.json"
+
+
+# ---------------------------------------------------------------- repo + state
+
+def repo_root(cwd=None):
+    out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd or os.getcwd(),
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return None
+    return Path(out.stdout.strip())
+
+
+def load_config(root):
+    cfg = dict(DEFAULT_CONFIG)
+    path = root / CONFIG_FILE
+    if path.exists():
+        cfg.update(json.loads(path.read_text()))
+    return cfg
+
+
+def state_path(root):
+    return root / STATE_DIR / "state.json"
+
+
+def load_state(root):
+    path = state_path(root)
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def save_state(root, state):
+    d = root / STATE_DIR
+    d.mkdir(exist_ok=True)
+    state_path(root).write_text(json.dumps(state, indent=2))
+    exclude = root / ".git" / "info" / "exclude"
+    if exclude.parent.exists():
+        text = exclude.read_text() if exclude.exists() else ""
+        if f"/{STATE_DIR}/" not in text:
+            exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + f"/{STATE_DIR}/\n")
+
+
+def git(root, *args):
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True).stdout
+
+
+def matches(rel, patterns):
+    return any(fnmatch.fnmatch(rel, p) for p in patterns)
+
+
+def is_test(rel, cfg):
+    return matches(rel, cfg["test_globs"]) and not matches(rel, cfg["ignore_globs"])
+
+
+def is_source(rel, cfg):
+    return (matches(rel, cfg["source_globs"]) and not is_test(rel, cfg)
+            and not matches(rel, cfg["ignore_globs"]))
+
+
+def repo_files(root):
+    out = git(root, "ls-files", "-co", "--exclude-standard")
+    return [l for l in out.splitlines() if l and not l.startswith(STATE_DIR + "/")]
+
+
+def test_hashes(root, cfg):
+    hashes = {}
+    for rel in repo_files(root):
+        if is_test(rel, cfg) and (root / rel).is_file():
+            hashes[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+    return hashes
+
+
+def changed_files(root, base):
+    tracked = git(root, "diff", "--name-only", base).splitlines()
+    untracked = git(root, "ls-files", "-o", "--exclude-standard").splitlines()
+    return sorted({f for f in tracked + untracked if f and not f.startswith(STATE_DIR + "/")})
+
+
+def run(cmd, root, timeout):
+    """Run a shell command; returns (ok, combined tail). Timeout counts as failure."""
+    try:
+        p = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True, timeout=timeout)
+        return p.returncode == 0, tail(p.stdout + p.stderr)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+
+
+def tail(text, n=30):
+    lines = [l for l in text.splitlines() if l.strip()]
+    return "\n".join(lines[-n:])
+
+
+# ---------------------------------------------------------------- mutation testing
+
+def mask_line(line):
+    """Blank out string literal contents and `//` comments so operators inside them are never mutated."""
+    out, i, in_str = [], 0, False
+    while i < len(line):
+        c = line[i]
+        if not in_str and line.startswith("//", i):
+            out.append(" " * (len(line) - i))
+            break
+        if c == '"' and (i == 0 or line[i - 1] != "\\"):
+            in_str = not in_str
+            out.append(c)
+        else:
+            out.append(" " if in_str else c)
+        i += 1
+    return "".join(out)
+
+
+# (name, pattern, replacement). Spaced comparison/arithmetic only, so generics `<T>` stay untouched.
+OPERATORS = [
+    ("== → !=", r"==", "!="),
+    ("!= → ==", r"!=", "=="),
+    ("<= → <", r"(?<=\s)<=(?=\s)", "<"),
+    (">= → >", r"(?<=\s)>=(?=\s)", ">"),
+    ("< → <=", r"(?<=\s)<(?=\s)", "<="),
+    ("> → >=", r"(?<=\s)>(?=\s)", ">="),
+    ("&& → ||", r"&&", "||"),
+    ("|| → &&", r"\|\|", "&&"),
+    ("true → false", r"\btrue\b", "false"),
+    ("false → true", r"\bfalse\b", "true"),
+    ("+ → -", r"(?<=\s)\+(?=\s)", "-"),
+    ("- → +", r"(?<=\s)-(?=\s)", "+"),
+    ("+= → -=", r"(?<=\s)\+=(?=\s)", "-="),
+    ("-= → +=", r"(?<=\s)-=(?=\s)", "+="),
+    ("min → max", r"\bmin\(", "max("),
+    ("max → min", r"\bmax\(", "min("),
+    ("drop !", r"(?<=[\s(])!(?=[A-Za-z_$(.])", ""),
+]
+
+SKIP_LINE = re.compile(r"^\s*(//|import\b|#|@|/\*|\*)")
+
+
+def line_mutants(line):
+    if SKIP_LINE.match(line):
+        return []
+    masked = mask_line(line)
+    found = []
+    for name, pattern, repl in OPERATORS:
+        for m in re.finditer(pattern, masked):
+            prev = masked[m.start() - 1] if m.start() else ""
+            nxt = masked[m.end():m.end() + 1]
+            # `!=` must not also be read as a `drop !`, and `==` must not be part of `===`.
+            if name == "drop !" and nxt == "=":
+                continue
+            if name == "== → !=" and (prev in ("=", "!") or nxt == "="):
+                continue
+            found.append((name, line[:m.start()] + repl + line[m.end():]))
+    return found
+
+
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def changed_lines(root, base, rel):
+    """1-based line numbers added/modified in `rel` since `base` (all lines for new files)."""
+    tracked = git(root, "ls-files", "--error-unmatch", rel).strip()
+    in_base = subprocess.run(["git", "cat-file", "-e", f"{base}:{rel}"], cwd=root,
+                             capture_output=True).returncode == 0
+    if not tracked or not in_base:
+        return set(range(1, len((root / rel).read_text().splitlines()) + 1))
+    lines = set()
+    for l in git(root, "diff", "-U0", "--no-color", base, "--", rel).splitlines():
+        m = HUNK.match(l)
+        if m:
+            start, count = int(m.group(1)), int(m.group(2) or "1")
+            lines.update(range(start, start + count))
+    return lines
+
+
+def collect_mutants(root, cfg, base):
+    mutants = []
+    for rel in changed_files(root, base):
+        if not is_source(rel, cfg) or not (root / rel).is_file():
+            continue
+        text = (root / rel).read_text()
+        lines = text.splitlines(keepends=True)
+        for n in sorted(changed_lines(root, base, rel)):
+            if n > len(lines):
+                continue
+            raw = lines[n - 1]
+            body, nl = raw.rstrip("\r\n"), raw[len(raw.rstrip("\r\n")):]
+            for name, mutated in line_mutants(body):
+                new = lines[:n - 1] + [mutated + nl] + lines[n:]
+                mutants.append({"file": rel, "line": n, "op": name,
+                                "original": body.strip(), "mutated": mutated.strip(),
+                                "content": "".join(new)})
+    return mutants
+
+
+def sample(items, k):
+    if len(items) <= k:
+        return items
+    step = len(items) / k
+    return [items[int(i * step)] for i in range(k)]
+
+
+def restore_backup(root):
+    path = root / STATE_DIR / BACKUP_FILE
+    if not path.exists():
+        return False
+    for rel, content in json.loads(path.read_text()).items():
+        (root / rel).write_text(content)
+    path.unlink()
+    return True
+
+
+def run_mutation(root, cfg, base, log=lambda s: None):
+    all_mutants = collect_mutants(root, cfg, base)
+    mutants = sample(all_mutants, cfg["max_mutants"])
+    results = {"total_generated": len(all_mutants), "tested": len(mutants),
+               "killed": 0, "survived": [], "unviable": 0}
+    if not mutants:
+        return results
+    backup = root / STATE_DIR / BACKUP_FILE
+
+    def on_signal(signum, frame):
+        raise SystemExit(128 + signum)
+    old = {s: signal.signal(s, on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for i, m in enumerate(mutants, 1):
+            path = root / m["file"]
+            original = path.read_text()
+            backup.write_text(json.dumps({m["file"]: original}))
+            try:
+                path.write_text(m["content"])
+                built, _ = run(cfg["build_cmd"], root, cfg["command_timeout"])
+                if not built:
+                    results["unviable"] += 1
+                    verdict = "unviable"
+                else:
+                    passed, _ = run(cfg["test_cmd"], root, cfg["command_timeout"])
+                    if passed:
+                        results["survived"].append({k: m[k] for k in ("file", "line", "op", "original", "mutated")})
+                        verdict = "SURVIVED"
+                    else:
+                        results["killed"] += 1
+                        verdict = "killed"
+            finally:
+                path.write_text(original)
+                backup.unlink(missing_ok=True)
+            log(f"  [{i}/{len(mutants)}] {verdict:8} {m['file']}:{m['line']} {m['op']}")
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+        # Leave the build products matching the restored sources.
+        run(cfg["build_cmd"], root, cfg["command_timeout"])
+    return results
+
+
+def score(results):
+    viable = results["killed"] + len(results["survived"])
+    return None if viable == 0 else results["killed"] / viable
+
+
+# ---------------------------------------------------------------- gate
+
+def gate(root, cfg, state, mutation=True, log=lambda s: None):
+    """Returns (passed, report_text, details)."""
+    details = {}
+    current = test_hashes(root, cfg)
+    locked = state["locked_tests"]
+    tampered = sorted(f for f in set(locked) | set(current) if locked.get(f) != current.get(f))
+    if tampered:
+        return False, ("Locked tests were modified, added or deleted while GREEN:\n  " + "\n  ".join(tampered)
+                       + "\nRestore them (`git diff` shows the change). Tests are the spec: change the code, "
+                         "not the tests. If a test is genuinely wrong, stop and ask the human to run `qg unlock`."), details
+
+    log("building…")
+    ok, out = run(cfg["build_cmd"], root, cfg["command_timeout"])
+    if not ok:
+        return False, "Build failed:\n" + out, details
+    log("running tests…")
+    ok, out = run(cfg["test_cmd"], root, cfg["command_timeout"])
+    if not ok:
+        return False, "Tests fail — keep implementing until the locked tests pass:\n" + out, details
+
+    if not mutation:
+        return True, "Integrity, build and tests OK (mutation skipped).", details
+
+    log("mutation testing changed lines…")
+    res = run_mutation(root, cfg, state["base"], log)
+    details["mutation"] = res
+    s = score(res)
+    head = (f"Mutation: {res['killed']} killed, {len(res['survived'])} survived, {res['unviable']} unviable "
+            f"({res['tested']} tested of {res['total_generated']} generated)")
+    if s is None:
+        return True, head + "\nNo viable mutants on the changed lines — nothing to score.", details
+    head += f", score {s:.0%} (threshold {cfg['mutation_threshold']:.0%})"
+    if s >= cfg["mutation_threshold"]:
+        return True, head, details
+    lines = [head, "", "Surviving mutants = behaviour your code has that NO locked test pins down.",
+             "Either the code is more complex than the spec requires (simplify it / delete it), or it is",
+             "untested logic beyond the spec (remove it, or stop and ask the human to `qg unlock` and add a test):"]
+    for m in res["survived"]:
+        lines.append(f"  {m['file']}:{m['line']}  [{m['op']}]  `{m['original']}`  →  `{m['mutated']}`")
+    return False, "\n".join(lines), details
+
+
+# ---------------------------------------------------------------- commands
+
+def need_root():
+    root = repo_root()
+    if root is None:
+        sys.exit("qg: not inside a git repository")
+    if restore_backup(root):
+        print("qg: restored a source file left mutated by an interrupted run")
+    return root
+
+
+def cmd_start(args):
+    root = need_root()
+    state = load_state(root)
+    if state and state["phase"] in ACTIVE:
+        sys.exit(f"qg: a gate is already active ({state['phase']}: {state['title']}). Finish it first, "
+                 "or ask the human to run `qg reset`.")
+    base = git(root, "rev-parse", "HEAD").strip()
+    if not base:
+        sys.exit("qg: the repository needs at least one commit")
+    title = " ".join(args) or "untitled"
+    save_state(root, {"phase": "red", "title": title, "base": base, "started": time.time(),
+                      "locked_tests": {}, "stop_blocks": 0})
+    dirty = git(root, "status", "--porcelain").strip()
+    print(f"qg: RED — {title}\n"
+          "Write tests for the behaviour that does not exist yet (small slices, one behaviour per test),\n"
+          "then run `qg lock`. Production code changes are allowed only to add the minimal API surface\n"
+          "(signatures/stubs) the tests need to compile.")
+    if dirty:
+        print("note: the working tree already had uncommitted changes; they count as part of this change.")
+
+
+def cmd_lock(args):
+    root = need_root()
+    cfg, state = load_config(root), load_state(root)
+    if not state or state["phase"] != "red":
+        sys.exit("qg: lock needs an active RED gate (`qg start`)")
+    new_tests = [f for f in changed_files(root, state["base"]) if is_test(f, cfg)]
+    if not new_tests:
+        sys.exit("qg: no test files changed since `qg start` — write the failing tests first")
+    built, out = run(cfg["build_cmd"], root, cfg["command_timeout"])
+    if built:
+        passed, out = run(cfg["test_cmd"], root, cfg["command_timeout"])
+        if passed:
+            sys.exit("qg: refusing to lock — the tests already PASS, so they do not specify new behaviour.\n"
+                     "Write a test that fails against the current code.")
+        red = "assertion"
+    else:
+        red = "compile"
+    state.update(phase="green", locked_tests=test_hashes(root, cfg), red_kind=red,
+                 red_evidence=out, locked_at=time.time(), stop_blocks=0)
+    save_state(root, state)
+    print(f"qg: GREEN — {len(state['locked_tests'])} test files locked (red by {red} failure).\n"
+          f"Changed test files: {', '.join(new_tests)}\n"
+          "Now implement the production code. Test files are read-only until the gate passes.")
+    if red == "compile":
+        print("note: tests fail to compile. Make sure that is because the API is missing, not a typo:\n" + tail(out, 8))
+
+
+def cmd_check(args):
+    root = need_root()
+    cfg, state = load_config(root), load_state(root)
+    if not state or state["phase"] != "green":
+        sys.exit("qg: check needs a GREEN gate (`qg lock`)")
+    ok, report, details = gate(root, cfg, state, mutation="--no-mutation" not in args,
+                               log=lambda s: print(s, flush=True))
+    finish(root, state, ok, report, details)
+    print(("PASS\n" if ok else "FAIL\n") + report)
+    sys.exit(0 if ok else 1)
+
+
+def finish(root, state, ok, report, details):
+    if ok and "mutation" in details:
+        state.update(phase="passed", passed_at=time.time(), report=report)
+    save_state(root, state)
+    (root / STATE_DIR / "last-report.json").write_text(json.dumps(
+        {"ok": ok, "report": report, "details": details, "at": time.time()}, indent=2))
+
+
+def cmd_status(args):
+    root = need_root()
+    state = load_state(root)
+    if not state:
+        print("qg: no gate")
+        return
+    print(f"qg: {state['phase'].upper()} — {state['title']} (base {state['base'][:8]}, "
+          f"{len(state['locked_tests'])} locked test files)")
+    if state.get("report"):
+        print(state["report"])
+
+
+def cmd_escalate(args):
+    root = need_root()
+    state = load_state(root)
+    if not state or state["phase"] != "green":
+        sys.exit("qg: escalate needs a GREEN gate")
+    if not args:
+        sys.exit('qg: say why, e.g. qg escalate "testX expects 20 but WCAG defines 21"')
+    state.update(phase="escalated", escalation=" ".join(args), escalated_at=time.time())
+    save_state(root, state)
+    print("qg: ESCALATED — tests stay locked. Stop now and explain the problem to the human;\n"
+          "they can `qg unlock` (fix the tests) or `qg resume` (keep going as is).")
+
+
+def cmd_resume(args):
+    root = need_root()
+    state = load_state(root)
+    if not state or state["phase"] != "escalated":
+        sys.exit("qg: nothing to resume")
+    state.update(phase="green", stop_blocks=0)
+    save_state(root, state)
+    print("qg: resumed — back to GREEN with the same locked tests.")
+
+
+def cmd_unlock(args):
+    root = need_root()
+    state = load_state(root)
+    if not state or state["phase"] not in LOCKED:
+        sys.exit("qg: nothing to unlock")
+    state.update(phase="red", locked_tests={}, stop_blocks=0)
+    save_state(root, state)
+    print("qg: unlocked — back to RED. Fix the tests, then `qg lock` again.")
+
+
+def cmd_reset(args):
+    root = need_root()
+    state_path(root).unlink(missing_ok=True)
+    print("qg: gate cleared")
+
+
+# ---------------------------------------------------------------- hooks
+
+WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+HUMAN_ONLY = re.compile(r"\bqg\b[^|;&\n]*\b(unlock|reset|resume)\b")
+MUTATING_SHELL = re.compile(
+    r"(>|\btee\b|\bsed\s+(-[a-zA-Z]*i|--in-place)|\bperl\s+-[a-zA-Z]*i|\brm\b|\bmv\b|\bcp\b|\btruncate\b"
+    r"|\bgit\s+(checkout|restore|stash|reset|apply|am|rm|mv|clean)\b|\bpatch\b|open\([^)]*['\"][wa])")
+REPO_WIDE_GIT = re.compile(r"\bgit\s+(stash|reset\s+--hard|checkout\s+(--\s+)?\.|restore\s+\.|clean\b)")
+
+
+def deny(reason):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                             "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+
+
+def pre_tool_use(event):
+    root = repo_root(event.get("cwd"))
+    if root is None:
+        return
+    state = load_state(root)
+    if not state or state["phase"] not in ACTIVE:
+        return
+    cfg = load_config(root)
+    tool, inp = event.get("tool_name"), event.get("tool_input") or {}
+    green = state["phase"] in LOCKED
+    locked_msg = ("qg: tests are LOCKED (phase GREEN). They are the spec — change production code, not tests. "
+                  "If a test is genuinely wrong, run `qg escalate \"why\"` and stop.")
+
+    if tool in WRITE_TOOLS:
+        raw = inp.get("file_path") or inp.get("notebook_path") or ""
+        p = Path(raw) if os.path.isabs(raw) else Path(event.get("cwd") or root) / raw
+        try:
+            rel = p.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            return
+        if rel.startswith(STATE_DIR + "/") or rel == CONFIG_FILE:
+            return deny("qg: the gate's state and config are human-only while a gate is active.")
+        if green and is_test(rel, cfg):
+            return deny(locked_msg)
+    elif tool == "Bash":
+        cmd = inp.get("command") or ""
+        if HUMAN_ONLY.search(cmd):
+            return deny("qg: `qg unlock` / `qg resume` / `qg reset` are human-only. If a locked test is wrong, run "
+                        "`qg escalate \"why\"` and stop.")
+        if (STATE_DIR in cmd or CONFIG_FILE in cmd) and MUTATING_SHELL.search(cmd):
+            return deny("qg: the gate's state and config are human-only while a gate is active.")
+        if green:
+            if REPO_WIDE_GIT.search(cmd):
+                return deny("qg: repo-wide git resets/stashes would touch locked tests. " + locked_msg)
+            mentions_test = any(is_test(tok.strip("'\"`;()"), cfg) or "Tests/" in tok for tok in cmd.split())
+            if mentions_test and MUTATING_SHELL.search(cmd):
+                return deny(locked_msg)
+
+
+def stop(event):
+    root = repo_root(event.get("cwd"))
+    if root is None:
+        return
+    restore_backup(root)
+    state = load_state(root)
+    if not state or state["phase"] not in ACTIVE:
+        return
+    if state["phase"] == "escalated":
+        if not event.get("stop_hook_active"):
+            print(json.dumps({"systemMessage": f"qg gate ESCALATED — needs a human: {state['escalation']}\n"
+                                               "Run `qg unlock` to fix the tests or `qg resume` to continue."}))
+        return
+    if state["phase"] == "red":
+        if event.get("stop_hook_active"):
+            return
+        print(json.dumps({"decision": "block", "reason":
+              f"qg gate '{state['title']}' is still RED: write the failing tests and run `qg lock`, "
+              "then implement. If you are blocked and need the human, say so clearly and stop again."}))
+        return
+    cfg = load_config(root)
+    ok, report, details = gate(root, cfg, state)
+    finish(root, state, ok, report, details)
+    if ok:
+        print(json.dumps({"systemMessage": f"qg gate passed — {state['title']}\n{report}"}))
+        return
+    state["stop_blocks"] = state.get("stop_blocks", 0) + 1
+    save_state(root, state)
+    if state["stop_blocks"] > cfg["max_stop_blocks"]:
+        print(json.dumps({"systemMessage": f"qg gate still FAILING after {cfg['max_stop_blocks']} attempts; "
+                          f"letting the agent stop. Needs a human.\n{report}"}))
+        return
+    print(json.dumps({"decision": "block",
+                      "reason": f"qg quality gate FAILED (attempt {state['stop_blocks']}/{cfg['max_stop_blocks']}). "
+                                f"You cannot finish yet.\n\n{report}\n\nIf you are certain a LOCKED TEST is wrong (not your code), "
+                                "run `qg escalate \"why\"` and stop instead of retrying."}))
+
+
+def session_start(event):
+    me = Path(__file__).resolve()
+    msg = (f"The `qg` quality gate CLI is at {me} (invoke it by that absolute path). "
+           "For any new feature or bugfix in a Swift/iOS repo, follow the spec-tdd skill: "
+           "`qg start` → failing tests → `qg lock` → implement; a Stop hook enforces the gate.")
+    root = repo_root(event.get("cwd"))
+    state = load_state(root) if root else None
+    if state and state["phase"] in ACTIVE:
+        msg += f" ACTIVE GATE: {state['phase'].upper()} — {state['title']}."
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": msg}}))
+
+
+def cmd_hook(args):
+    event = json.loads(sys.stdin.read() or "{}")
+    {"pre-tool-use": pre_tool_use, "stop": stop, "session-start": session_start}[args[0]](event)
+
+
+COMMANDS = {"start": cmd_start, "lock": cmd_lock, "check": cmd_check, "status": cmd_status,
+            "unlock": cmd_unlock, "escalate": cmd_escalate, "resume": cmd_resume, "reset": cmd_reset, "hook": cmd_hook}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__)
+        sys.exit(2)
+    COMMANDS[sys.argv[1]](sys.argv[2:])

@@ -1,0 +1,7 @@
+{
+  "name": "ios-quality-gate",
+  "version": "0.1.0",
+  "description": "Spec-first TDD gate for coding agents on Swift/iOS: failing tests get locked, the agent implements, and a Stop hook won't let it finish until build, tests and mutation testing on the changed lines pass.",
+  "author": { "name": "MatiasPC" },
+  "license": "MIT"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "matiaspc-local",
+  "owner": { "name": "MatiasPC" },
+  "plugins": [
+    {
+      "name": "ios-quality-gate",
+      "source": "./",
+      "description": "Spec-first TDD gate for coding agents on Swift/iOS: locked failing tests, mutation testing, Stop-hook enforcement."
+    }
+  ]
+}

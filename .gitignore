@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.quality-gate/
+.DS_Store
